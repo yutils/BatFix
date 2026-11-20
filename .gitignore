@@ -1,0 +1,50 @@
+# ---- 编译输出：dist 整个目录不提交 ----
+dist/
+*.obj
+*.ilk
+*.pdb
+*.exp
+*.idb
+*.tlog
+*.lastbuildstate
+
+# ---- BatFix 运行时生成的备份 ----
+*.bak
+*.bak.*
+
+# ---- 测试自动生成的数据（由 tests/make_cases.py / verify.py 产生）----
+tests/cases/
+tests/out/
+tests/out2/
+tests/inplace/
+tests/repair/
+tests/opts/
+tests/singleton/
+tests/display_out/
+tests/user_cases/
+tests/user_cases_out/
+tests/user_run/
+tests/backup_diag/
+tests/backup_matrix/
+tests/backup_toggle/
+tests/update_work/
+tests/runtime/
+tests/runtime2/
+tests/runtime3/
+tests/report*.tsv
+tests/user_report.tsv
+tests/manifest.json
+
+# ---- 编辑器 / 系统 ----
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+*.swp
+*~
+
+# ---- WorkBuddy 本地工作数据 ----
+.workbuddy/
+
+# 界面截图放在 doc/ 并随仓库提交；预编译 exe 走 GitHub Releases 分发。

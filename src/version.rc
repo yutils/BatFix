@@ -1,0 +1,34 @@
+#include "version.h"
+#include <winres.h>
+
+// Application icon (Explorer / taskbar / window title bar)
+101 ICON "BatFix.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    BATFIX_VERSION_NUM
+ PRODUCTVERSION BATFIX_VERSION_NUM
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "yutils"
+            VALUE "FileDescription",  "BatFix - Batch Encoding Fixer"
+            VALUE "FileVersion",      BATFIX_VERSION_TEXT
+            VALUE "InternalName",     "BatFix"
+            VALUE "OriginalFilename", BATFIX_EXE_NAME
+            VALUE "ProductName",      "BatFix"
+            VALUE "ProductVersion",   BATFIX_VERSION_TEXT
+            VALUE "LegalCopyright",   "Copyright (C) 2026 yutils. MIT License."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
