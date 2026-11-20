@@ -34,10 +34,18 @@ struct Ui {
     int done = 0, changed = 0, errors = 0, backed = 0;
     std::vector<Row> rows;
     HICON hAppIcon = nullptr;
+    W toastText;
+    DWORD toastStart = 0;
+    bool toastOn = false, toastPinned = false;   // pinned = screenshot mode
     HFONT fTitle = nullptr, fSub = nullptr, fBody = nullptr,
           fSmall = nullptr, fPill = nullptr, fStat = nullptr, fNum = nullptr;
 };
 static Ui g_ui;
+static const UINT IDT_TOAST = 4711;
+static const DWORD kToastLife = 2400;           // ms
+// Only a user-initiated check may raise the "already latest" toast. The
+// automatic startup check must never interrupt anyone.
+static volatile LONG g_toastOnLatest = 0;
 static const UINT cps[6] = { 0, 936, 950, 932, 1252, 65001 };
 static const wchar_t* cpNames[6] = { L"自动", L"GBK", L"Big5", L"SJIS", L"Latin", L"UTF-8" };
 static const wchar_t* cpFull[6] = {
@@ -179,6 +187,74 @@ static void ShowEncodingMenu(HWND hwnd) {
     }
 }
 
+// ------------------------------------------------------------------ toast
+// A lightweight, non-modal floating card at the bottom centre. It fades in,
+// stays for ~2 s, fades out and never steals focus or blocks clicking.
+static W LatestToastText() {
+    return L"已是最新版  v" + W(BATFIX_VERSION_WTEXT);
+}
+// Optional diagnostic hook for tests/test_update.py. A normal double-click
+// never sets BATFIX_TOAST_TRACE, so this is a complete no-op for users.
+static void TraceToast(const W& line) {
+    DWORD n = GetEnvironmentVariableW(L"BATFIX_TOAST_TRACE", nullptr, 0);
+    if (!n) return;
+    W f((size_t)n + 1, L'\0');
+    GetEnvironmentVariableW(L"BATFIX_TOAST_TRACE", &f[0], n + 1);
+    f.resize(wcslen(f.c_str()));
+    if (f.empty()) return;
+    HANDLE hf = CreateFileW(f.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    Bytes b; WideToUtf8(line + L"\n", b);
+    DWORD wr = 0; WriteFile(hf, b.data(), (DWORD)b.size(), &wr, nullptr);
+    CloseHandle(hf);
+}
+static void ShowToast(HWND hwnd, const W& text) {
+    TraceToast(L"TOAST " + text);
+    g_ui.toastText = text;
+    g_ui.toastStart = GetTickCount();
+    g_ui.toastOn = true;
+    g_ui.toastPinned = false;
+    SetTimer(hwnd, IDT_TOAST, 40, nullptr);
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+static double ToastAlpha() {
+    if (g_ui.toastPinned) return 1.0;
+    DWORD e = GetTickCount() - g_ui.toastStart;
+    double fi = e < 180 ? (double)e / 180.0 : 1.0;
+    double fo = e > 1900 ? 1.0 - (double)(e - 1900) / 500.0 : 1.0;
+    double a = fi < fo ? fi : fo;
+    return a < 0 ? 0 : a;
+}
+static void DrawToast(HDC dc, double a) {
+    const Theme& t = T();
+    int w = D(246), h = D(46);
+    RECT tr = R((g_ui.cx - w) / 2, g_ui.cy - h - D(26), w, h);
+    COLORREF base = g_ui.dark ? RGB(236, 241, 249) : RGB(28, 34, 46);
+    COLORREF fg   = g_ui.dark ? RGB(20, 26, 36)   : RGB(242, 246, 252);
+    COLORREF fill = LerpC(t.bg, base, a);
+    COLORREF text = LerpC(t.bg, fg, a);
+    RoundRect2(dc, tr, D(23), fill, fill);
+    int cx = tr.left + D(27), cy = (tr.top + tr.bottom) / 2;
+    COLORREF gc = LerpC(fill, t.ok, a);
+    HBRUSH gb = CreateSolidBrush(gc);
+    HPEN gp = (HPEN)GetStockObject(NULL_PEN);
+    HGDIOBJ ob = SelectObject(dc, gb), op = SelectObject(dc, gp);
+    Ellipse(dc, cx - D(9), cy - D(9), cx + D(9), cy + D(9));
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(gb);
+    COLORREF tick = LerpC(gc, RGB(255, 255, 255), a);
+    Line(dc, cx - D(4), cy, cx - D(1), cy + D(3), tick, D(2));
+    Line(dc, cx - D(1), cy + D(3), cx + D(5), cy - D(4), tick, D(2));
+    Txt(dc, g_ui.toastText,
+        R(tr.left + D(46), tr.top, tr.right - tr.left - D(54), tr.bottom - tr.top),
+        g_ui.fPill, text, DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+}
+static void PaintToast(HDC dc) {
+    if (!g_ui.toastOn) return;
+    double a = ToastAlpha();
+    if (a > 0) DrawToast(dc, a);
+}
+
 static void Paint(HDC dc) {
     const Theme& t = T();
     RECT all = R(0, 0, g_ui.cx, g_ui.cy);
@@ -228,8 +304,9 @@ static void Paint(HDC dc) {
     bool uHot = g_ui.hover == 41, uNew = us == UPD_AVAILABLE;
     RoundRect2(dc, ur, D(15), uNew ? t.accentSoft : (uHot ? t.hover : t.card),
                uNew ? t.accent : t.border);
-    W uLab = us == UPD_LATEST ? L"已是最新" :
-             (uNew ? W(L"发现 ") + DisplayVer(g_newVer) : W(L"检查更新"));
+    W uLab = us == UPD_CHECKING ? W(L"检查中…") :
+             (us == UPD_LATEST ? W(L"已是最新") :
+              (uNew ? W(L"发现 ") + DisplayVer(g_newVer) : W(L"检查更新")));
     Txt(dc, uLab,
         R(ur.left + D(8), ur.top, ur.right - ur.left - D(16), ur.bottom - ur.top),
         g_ui.fPill, uNew ? t.accent : (uHot ? t.text : t.muted),
@@ -346,6 +423,7 @@ static void Paint(HDC dc) {
         RoundBorder(dc, lr, D(10), t.border);
         Txt(dc, L"转换结果显示在这里 · 点击任意一行看详情", lr, g_ui.fSmall, t.muted,
             DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+        PaintToast(dc);
         return;
     }
     int maxScroll = (int)g_ui.rows.size() > vr ? (int)g_ui.rows.size() - vr : 0;
@@ -375,6 +453,7 @@ static void Paint(HDC dc) {
         int pos = (int)((double)g_ui.scroll / maxScroll * (track - thumb));
         RoundRect2(dc, R(lr.right + D(6), lr.top + pos, D(3), thumb), D(2), t.border, t.border);
     }
+    PaintToast(dc);
 }
 
 static W ShortEnc(const W& e) {
@@ -490,8 +569,9 @@ static bool SavePreviewBmp(const W& path, int w, int h) {
 
 static void OnUpdateClick(HWND hwnd) {
     int st = UpdateState();
-    if (st == UPD_CHECKING) return;                 // already running, do nothing
     if (st == UPD_AVAILABLE) {
+        // The red dot is already the notification; clicking gives the
+        // version comparison plus a one-click download link.
         W msg = L"当前版本：v" + W(BATFIX_VERSION_WTEXT) + L"\r\n" +
                 L"最新版本：" + DisplayVer(g_newVer) + L"\r\n\r\n" +
                 L"是否前往 GitHub Releases 下载新版本？";
@@ -500,14 +580,15 @@ static void OnUpdateClick(HWND hwnd) {
             const wchar_t* page = g_newUrl[0] ? g_newUrl : kUpdatePage;
             ShellExecuteW(hwnd, L"open", page, nullptr, nullptr, SW_SHOWNORMAL);
         }
-    } else if (st == UPD_LATEST) {
-        W s = W(L"当前已是最新版本 v") + W(BATFIX_VERSION_WTEXT);
-        MessageBoxW(hwnd, s.c_str(), L"检查更新", MB_OK | MB_ICONINFORMATION);
-    } else {
-        // UPD_FAILED (offline / 404 / no release yet) or UPD_IDLE: retry once.
-        // A failed check never shows an error box -- it stays completely silent.
-        StartUpdateCheck(hwnd);
+        InterlockedExchange(&g_toastOnLatest, 0);
+        return;
     }
+    // Every explicit click performs a real re-check. Only when that check
+    // actually reaches GitHub and confirms "up to date" do we toast; the
+    // automatic startup check never toasts, and any failure stays silent.
+    InterlockedExchange(&g_toastOnLatest, 1);
+    if (st == UPD_CHECKING) return;   // result will arrive via WM_APP_UPDATE_RESULT
+    StartUpdateCheck(hwnd);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -624,11 +705,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
-    case WM_APP_UPDATE_RESULT:
+    case WM_APP_UPDATE_RESULT: {
         // Background thread finished (state already published with a barrier).
+        if (InterlockedCompareExchange(&g_toastOnLatest, 0, 0) == 1) {
+            InterlockedExchange(&g_toastOnLatest, 0);
+            if ((int)wp == UPD_LATEST)
+                ShowToast(hwnd, LatestToastText());
+            // AVAILABLE -> red dot is the notification; FAILED -> silent.
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
+    }
+    case WM_TIMER:
+        if ((UINT)wp == IDT_TOAST) {
+            if (GetTickCount() - g_ui.toastStart >= kToastLife) {
+                KillTimer(hwnd, IDT_TOAST);
+                g_ui.toastOn = false;
+                g_ui.toastPinned = false;
+                g_ui.toastText.clear();
+                TraceToast(L"TOAST_END");
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);   // fade in / fade out
+            return 0;
+        }
+        break;
     case WM_DESTROY:
+        KillTimer(hwnd, IDT_TOAST);
         for (HFONT f : { g_ui.fTitle, g_ui.fSub, g_ui.fBody, g_ui.fSmall,
                          g_ui.fPill, g_ui.fStat, g_ui.fNum })
             if (f) DeleteObject(f);
@@ -649,7 +751,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     bool cli = false, smoke = false, darkShot = false;
     bool selftestUpdate = false, updateSync = false, updateDemo = false;
-    bool noUpdateCheck = false;
+    bool noUpdateCheck = false, toastDemo = false;
     W shotPath, updateFile;
     std::vector<W> startup;
     for (int i = 1; i < argc; ++i) {
@@ -659,6 +761,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         else if (lstrcmpiW(argv[i], L"--selftest-update") == 0) selftestUpdate = true;
         else if (lstrcmpiW(argv[i], L"--update-sync") == 0) updateSync = true;
         else if (lstrcmpiW(argv[i], L"--update-demo") == 0) updateDemo = true;
+        else if (lstrcmpiW(argv[i], L"--toast-demo") == 0) toastDemo = true;
         else if (lstrcmpiW(argv[i], L"--no-update-check") == 0) noUpdateCheck = true;
         else if (lstrcmpiW(argv[i], L"--shot") == 0 && i + 1 < argc) shotPath = argv[++i];
         else if (lstrcmpiW(argv[i], L"--update-file") == 0 && i + 1 < argc) updateFile = argv[++i];
@@ -748,6 +851,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 CopyPod(g_newVer, 64, v);
                 CopyPod(g_newUrl, 512, u);
             } else { g_newVer[0] = 0; g_newUrl[0] = 0; }
+        }
+        if (toastDemo) {
+            g_ui.toastText = LatestToastText();
+            g_ui.toastOn = true;
+            g_ui.toastPinned = true;   // fully visible, no timer, for screenshots
         }
         SavePreviewBmp(shotPath, 820, 560);
         PostMessageW(hwnd, WM_CLOSE, 0, 0);

@@ -24,7 +24,7 @@
 - 自绘卡片式布局，浅色 / 深色主题（右上角切换），文字极少
 - 顶部品牌渐变条 + 真实应用图标 + 版本徽章；底部 4 个统计卡片（已处理 / 已修改 / 已备份 / 失败）
 - **首页信息条明确标注「完全免费」与 MIT 协议**，并展示可点击的开源地址 `github.com/yutils/BatFix`（点击用默认浏览器打开）
-- 右上角「检查更新」：启动后后台查询 GitHub Releases，发现新版本才亮**小红点**；联网失败完全静默
+- 右上角「检查更新」：启动后后台查询 GitHub Releases，发现新版本才亮**小红点**；点击确认是最新版时底部弹 toast；联网失败完全静默
 - 渐变拖放区，也可点击选择文件；支持拖入整个文件夹（递归）
 - 4 个明确的复选框 + 1 个「源编码」下拉
 - 结果列表一行一条摘要，**点击某行**查看该文件完整报告
@@ -91,15 +91,26 @@ python tools/make_icon.py
 
 ## 检查更新与发布规范
 
-启动后会在**后台线程**向 `https://api.github.com/repos/yutils/BatFix/releases/latest` 发一个 HTTPS GET，不阻塞窗口。右上角「检查更新」按钮：
+启动后会在**后台线程**检查 GitHub Releases，不阻塞窗口（实测窗口 0.04 s 出现，检查进行中 UI 仍可响应）。右上角「检查更新」按钮：
 
 | 结果 | 表现 |
 |---|---|
 | 有更新的 Release | 按钮变成「发现 v0.0.2」，右上角出现**小红点**；点击弹窗对比当前 / 最新版本，确认后打开该 Release 下载页 |
-| 已是最新 | 按钮显示「已是最新」，点击提示当前版本 |
+| **已是最新** | 按钮显示「已是最新」；**点击后重新联网确认，底部弹出 toast「已是最新版 v0.0.1」**，约 2.4 秒淡出消失 |
 | **无网络 / 超时 / 404 / 限流 / JSON 异常** | **完全静默**：不弹窗、不报错、不显示红点，按钮保持「检查更新」 |
 
 ![发现新版本时的红点提示](doc/BatFix_界面预览_更新提示.png)
+
+![已是最新版时的 toast](doc/BatFix_界面预览_Toast.png)
+
+toast 是纯自绘浮层：**不抢焦点、不阻塞点击、不需要确认**，支持浅色 / 深色主题。只有**用户主动点击**才可能提示：启动时的自动检查无论结果如何都不打扰；且必须「检查真正成功 + 版本不比本地新」才 toast，联网失败依旧完全静默。点击瞬间按钮变「检查中…」，完成后恢复。
+
+**两条检查通道**（避免 API 限流导致永远查不到）：
+
+1. 优先请求 REST API `api.github.com/repos/yutils/BatFix/releases/latest`，可拿到 `tag_name`、`name`、`html_url`；
+2. 若 API 返回 403 / 404 或任何失败，自动改走网页 `github.com/yutils/BatFix/releases/latest` 的 **302 重定向**，从 `Location` 中读出 `/releases/tag/<tag>` 作为版本号。未认证 REST API 每个出口 IP 每小时仅 60 次配额，共享网络很容易 403，而网页重定向不受此限制。
+
+两条都失败才判定为静默。`--update-sync` 会打印实际使用的通道（`source=api` / `source=web`）与失败原因（`diag=...`）。
 
 **发布命名约定**（按你定的规则实现）：
 
@@ -112,7 +123,7 @@ python tools/make_icon.py
 
 工具同时读取 API 的 `tag_name` 与 `name`，两者都能解析出版本号；若不一致取较大的那个，避免 tag 写错导致漏提示。版本按数字段逐段比较（`v0.0.2 > v0.0.1`、`v0.1 > v0.0.9`），数字段相同时带 `-beta` 后缀的预发布不算比正式版新。下载页优先用 API 返回的 `html_url`，并校验必须是本仓库的 `https://github.com/` 地址，否则回退到 Releases 首页。
 
-**目前仓库还没有 Release**，API 返回 404，所以现在启动不会有任何提示 —— 这是预期行为。等你上传第一个 Release 后，旧版本启动就会自动亮红点。
+**当前已发布 tag `0.0.1` / Release `v0.0.1`**，与本地版本一致，所以启动不会有红点；点击「检查更新」会看到「已是最新版 v0.0.1」的 toast。以后发布更高版本（如 `0.0.2`）后，旧版本启动才会自动亮红点。
 
 发布新版本的顺序：
 
@@ -121,7 +132,7 @@ python tools/make_icon.py
 3. 勾选 **Set as the latest release**（`/releases/latest` 只返回被标记为 Latest 的那个）
 4. 同步更新 README 里的版本号与文件名
 
-> 隐私：除这一个 GET 外没有任何网络行为，不收集设备信息、不上传脚本内容。离线 / 内网环境可用 `--no-update-check` 启动以完全禁用检查。`winhttp.dll` 是运行时动态加载的系统组件，exe 静态依赖仍是 5 个系统 DLL。
+> 隐私：只发出上述 GET（第二个仅在第一个失败时才发），不收集设备信息、不上传脚本内容。离线 / 内网环境可用 `--no-update-check` 完全禁用。`winhttp.dll` 是运行时动态加载的系统组件，exe 静态依赖仍是 5 个系统 DLL。
 
 开发者诊断参数（仅供自测）：
 
@@ -132,6 +143,8 @@ python tools/make_icon.py
 | `--update-sync` | 同步执行一次真实网络检查，打印结果后退出，不建窗口 |
 | `--update-file <json>` | 用本地 JSON 冒充 API 响应，走完整「解析 → 判定 → 渲染」链路 |
 | `--update-demo` | 配合 `--shot` 渲染带红点的界面预览 |
+| `--toast-demo` | 配合 `--shot` 渲染「已是最新版」toast 预览 |
+| `BATFIX_TOAST_TRACE=<文件>` | 测试用环境变量，把 toast 的出现/消失写入文件；正常启动不设置，无任何副作用 |
 
 ## 转换规则
 
@@ -207,7 +220,7 @@ python check_user_cases.py    :: 用户实际报告有问题的 4 个文件
 python test_backup_matrix.py  :: 备份矩阵（10 文件 + 连拖 3 次 + 3 种 CLI 模式）
 python test_backup_toggle.py  :: 复选框开/关 + 防误触
 python test_singleton.py      :: 单例与参数转发
-python test_update.py         :: 更新检查（27 项逻辑断言 + 真实网络 + 10 个 JSON 场景 + 静默验证）
+python test_update.py         :: 更新检查（27 项逻辑断言 + 真实网络 + 10 个 JSON 场景 + toast 生命周期 + 静默验证）
 ..\dist\BatFix_v0.0.1.exe --smoke    :: GUI 窗口创建自检
 ```
 
@@ -218,7 +231,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run_display.ps1
 python tests\check_runtime.py
 ```
 
-当前结果：119 用例、117 个输出二次转换 100% 幂等，8 个显示用例 + 4 个用户文件真实运行中文完整、无报错、无多余输出；更新检查专项 40+ 项断言全绿（含启动 0.04 s 不被网络阻塞、失败不弹任何对话框、10 种 Release JSON 场景的红点像素校验）。
+当前结果：119 用例、117 个输出二次转换 100% 幂等，8 个显示用例 + 4 个用户文件真实运行中文完整、无报错、无多余输出；更新检查专项 50+ 项断言全绿（启动 0.04 s 不被阻塞、检查过程零模态弹窗、10 种 Release JSON 场景的红点像素校验、toast 出现/自动消失、深浅主题渲染）。真实点击场景亦已实测：连真 GitHub 后约 0.4 s 弹出「已是最新版 v0.0.1」。
 
 ## 目录结构
 
@@ -241,7 +254,8 @@ BatFix/
 │   ├── BatFix_图标.png           # 图标 256px 预览
 │   ├── BatFix_界面预览.png       # 界面截图（浅色）
 │   ├── BatFix_界面预览_深色.png  # 界面截图（深色）
-│   └── BatFix_界面预览_更新提示.png  # 发现新版本时的红点
+│   ├── BatFix_界面预览_更新提示.png  # 发现新版本时的红点
+│   └── BatFix_界面预览_Toast.png     # 已是最新版时的 toast
 ├── dist/                   # 本地编译输出，已忽略，不进仓库
 │   ├── BatFix_v0.0.1.exe          # x64
 │   └── BatFix_v0.0.1_x86.exe      # x86
@@ -255,7 +269,7 @@ BatFix/
 - **mojibake 修复是启发式的**，只在「重新按 GBK 编码后恰好是合法 UTF-8」的数学验证通过时才改写，默认关闭。
 - `chcp 65001` 会改变控制台代码页；若脚本用它读写外部 GBK 文件，工具会给出警告，需人工复核。
 - 每次原地转换都生成递增备份，反复拖会累积 `.bak.N`；不想要就取消勾选「转换前自动备份」。
-- **检查更新依赖 GitHub API**：未认证请求限流 60 次/小时，且 `/releases/latest` 只返回被标记为 Latest 的 Release；任何失败都静默，不影响转换功能。离线环境可用 `--no-update-check`。
+- **检查更新依赖 GitHub**：REST API 未认证限流 60 次/小时（触发 403 时自动改走网页重定向），`/releases/latest` 只返回被标记为 Latest 的 Release；若两条通道都不可用则静默跳过，不影响转换功能。离线环境可用 `--no-update-check`。
 
 ## 参考与致谢
 

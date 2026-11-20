@@ -13,6 +13,8 @@
 
 static const wchar_t* kUpdateApiHost = L"api.github.com";
 static const wchar_t* kUpdateApiPath = L"/repos/yutils/BatFix/releases/latest";
+static const wchar_t* kUpdateWebHost = L"github.com";
+static const wchar_t* kUpdateWebPath = L"/yutils/BatFix/releases/latest";
 static const wchar_t* kUpdatePage    = L"https://github.com/yutils/BatFix/releases/latest";
 static const UINT WM_APP_UPDATE_RESULT = WM_APP + 17;
 
@@ -24,6 +26,9 @@ static wchar_t g_newUrl[512] = L"";
 // Developer/test hook only: when non-empty, FetchLatest reads this local
 // JSON file instead of calling GitHub. Never used in a normal double-click.
 static W g_updateFile;
+// Diagnostics for --update-sync (written only by the check thread).
+static wchar_t g_updSource[16] = L"-";
+static wchar_t g_updDiag[128]  = L"not started";
 
 static int UpdateState() { return (int)InterlockedCompareExchange(&g_updState, 0, 0); }
 static void CopyPod(wchar_t* dst, size_t cap, const W& s) {
@@ -151,23 +156,35 @@ typedef BOOL (WINAPI *P_Recv)(WH, LPVOID);
 typedef BOOL (WINAPI *P_Avail)(WH, LPDWORD);
 typedef BOOL (WINAPI *P_Read)(WH, LPVOID, DWORD, LPDWORD);
 typedef BOOL (WINAPI *P_QueryHdr)(WH, DWORD, LPCWSTR, LPVOID, LPDWORD, LPDWORD);
+typedef BOOL (WINAPI *P_SetOption)(WH, DWORD, LPVOID, DWORD);
 
 static bool FetchLatest(W& ver, W& url) {
+    CopyPod(g_updSource, 16, L"-");
+    CopyPod(g_updDiag, 128, L"not started");
     if (!g_updateFile.empty()) {
         // Offline end-to-end test: the rest of the pipeline (JSON parse,
         // version compare, state publish, red dot) is the real one.
         Bytes raw; W err;
-        if (!ReadAll(g_updateFile, raw, err)) return false;
+        if (!ReadAll(g_updateFile, raw, err)) {
+            CopyPod(g_updDiag, 128, L"local json unreadable"); return false;
+        }
         W json;
-        if (!Utf8ToWide(raw.data(), (int)raw.size(), json, false)) return false;
-        return ParseReleaseJson(json, ver, url);
+        if (!Utf8ToWide(raw.data(), (int)raw.size(), json, false)) {
+            CopyPod(g_updDiag, 128, L"local json not utf-8"); return false;
+        }
+        if (!ParseReleaseJson(json, ver, url)) {
+            CopyPod(g_updDiag, 128, L"local json has no usable version"); return false;
+        }
+        CopyPod(g_updSource, 16, L"file");
+        CopyPod(g_updDiag, 128, L"local json ok");
+        return true;
     }
     HMODULE mod = LoadLibraryW(L"winhttp.dll");
-    if (!mod) return false;                       // e.g. stripped-down system
+    if (!mod) { CopyPod(g_updDiag, 128, L"winhttp.dll missing"); return false; }
     struct Api {
         P_Open open; P_Close close; P_Timeouts timeouts; P_Connect connect;
         P_OpenReq openReq; P_AddHdr addHdr; P_Send send; P_Recv recv;
-        P_Avail avail; P_Read read; P_QueryHdr queryHdr;
+        P_Avail avail; P_Read read; P_QueryHdr queryHdr; P_SetOption setOption;
     } a = {};
     a.open      = (P_Open)    GetProcAddress(mod, "WinHttpOpen");
     a.close     = (P_Close)   GetProcAddress(mod, "WinHttpCloseHandle");
@@ -180,8 +197,10 @@ static bool FetchLatest(W& ver, W& url) {
     a.avail     = (P_Avail)   GetProcAddress(mod, "WinHttpQueryDataAvailable");
     a.read      = (P_Read)    GetProcAddress(mod, "WinHttpReadData");
     a.queryHdr  = (P_QueryHdr)GetProcAddress(mod, "WinHttpQueryHeaders");
+    a.setOption = (P_SetOption)GetProcAddress(mod, "WinHttpSetOption");
     if (!a.open || !a.close || !a.timeouts || !a.connect || !a.openReq ||
         !a.addHdr || !a.send || !a.recv || !a.avail || !a.read || !a.queryHdr) {
+        CopyPod(g_updDiag, 128, L"winhttp exports incomplete");
         FreeLibrary(mod); return false;
     }
 
@@ -206,8 +225,9 @@ static bool FetchLatest(W& ver, W& url) {
                     a.send(q, nullptr, 0, nullptr, 0, 0, 0) &&
                     a.recv(q, nullptr)) {
                     DWORD code = 0, sz = sizeof(code);
-                    if (a.queryHdr(q, kStatusNumber, nullptr, &code, &sz, nullptr) &&
-                        code == 200) {
+                    bool haveCode = a.queryHdr(q, kStatusNumber, nullptr,
+                                               &code, &sz, nullptr) != 0;
+                    if (haveCode && code == 200) {
                         Bytes body;
                         bool readOk = true;
                         for (;;) {
@@ -228,13 +248,88 @@ static bool FetchLatest(W& ver, W& url) {
                         if (readOk && !body.empty() &&
                             Utf8ToWide(body.data(), (int)body.size(), json, false))
                             ok = ParseReleaseJson(json, ver, url);
+                        if (ok) {
+                            CopyPod(g_updSource, 16, L"api");
+                            CopyPod(g_updDiag, 128, L"api ok");
+                        } else {
+                            CopyPod(g_updDiag, 128, L"api code=200 body unusable");
+                        }
+                    } else {
+                        // Typically 403 (unauthenticated API rate limit,
+                        // 60/hour per IP) or 404 (no release yet).
+                        CopyPod(g_updDiag, 128, L"api code=" + Itow(haveCode ? code : 0));
                     }
+                } else {
+                    CopyPod(g_updDiag, 128, L"api request failed");
                 }
                 a.close(q);
+            } else {
+                CopyPod(g_updDiag, 128, L"api open-request failed");
             }
             a.close(c);
+        } else {
+            CopyPod(g_updDiag, 128, L"api connect failed");
+        }
+
+        // ---- fallback: the plain web redirect is NOT subject to the REST
+        // API rate limit. GET /yutils/BatFix/releases/latest normally replies
+        // 302 with Location: .../releases/tag/<tag>. Disable auto-follow so
+        // we can read the tag from the header without downloading any HTML.
+        if (!ok) {
+            const DWORD kNeverFollow = 0;          // WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+            const DWORD kOptRedirect = 88;         // WINHTTP_OPTION_REDIRECT_POLICY
+            const DWORD kQueryLocation = 33;       // WINHTTP_QUERY_LOCATION
+            WH c2 = a.connect(s, kUpdateWebHost, (WORD)443, 0);
+            if (c2) {
+                WH q2 = a.openReq(c2, L"GET", kUpdateWebPath, nullptr, nullptr,
+                                  nullptr, kFlagSecure);
+                if (q2) {
+                    DWORD policy = kNeverFollow;
+                    if (a.setOption) a.setOption(q2, kOptRedirect, &policy, sizeof(policy));
+                    W hdr2 = L"User-Agent: " + agent + L"\r\n";
+                    if (a.addHdr(q2, hdr2.c_str(), (DWORD)-1, kAddreqAdd) &&
+                        a.send(q2, nullptr, 0, nullptr, 0, 0, 0) &&
+                        a.recv(q2, nullptr)) {
+                        DWORD code2 = 0, sz2 = sizeof(code2);
+                        a.queryHdr(q2, kStatusNumber, nullptr, &code2, &sz2, nullptr);
+                        wchar_t loc[1024] = { 0 };
+                        DWORD locLen = sizeof(loc) - sizeof(wchar_t);
+                        if (a.queryHdr(q2, kQueryLocation, nullptr, loc,
+                                       &locLen, nullptr) && loc[0]) {
+                            W s2(loc);
+                            const wchar_t* key = L"/releases/tag/";
+                            size_t p = s2.find(key);
+                            if (p != W::npos) {
+                                W tag = s2.substr(p + wcslen(key));
+                                size_t e = tag.find_first_of(L"/?#");
+                                if (e != W::npos) tag = tag.substr(0, e);
+                                if (ParseVer(tag).valid) {
+                                    ver = tag;
+                                    url = kUpdatePage;
+                                    ok = true;
+                                    CopyPod(g_updSource, 16, L"web");
+                                    CopyPod(g_updDiag, 128,
+                                            W(L"web redirect -> tag=") + tag);
+                                }
+                            }
+                        }
+                        if (!ok) CopyPod(g_updDiag, 128,
+                            L"web code=" + Itow(code2) + L" no tag in Location");
+                    } else {
+                        CopyPod(g_updDiag, 128, L"web request failed");
+                    }
+                    a.close(q2);
+                } else {
+                    CopyPod(g_updDiag, 128, L"web open-request failed");
+                }
+                a.close(c2);
+            } else {
+                CopyPod(g_updDiag, 128, L"web connect failed");
+            }
         }
         a.close(s);
+    } else {
+        CopyPod(g_updDiag, 128, L"winhttp session failed");
     }
     FreeLibrary(mod);
     return ok;
@@ -262,6 +357,7 @@ static unsigned __stdcall UpdateThread(void* arg) {
 static void StartUpdateCheck(HWND hwnd) {
     if (InterlockedCompareExchange(&g_updBusy, 1, 0) != 0) return;  // one at a time
     InterlockedExchange(&g_updState, UPD_CHECKING);
+    if (hwnd && IsWindow(hwnd)) InvalidateRect(hwnd, nullptr, FALSE);  // "检查中…"
     uintptr_t h = _beginthreadex(nullptr, 0, UpdateThread, (void*)hwnd, 0, nullptr);
     if (h) CloseHandle((HANDLE)h);
     else {
@@ -334,10 +430,13 @@ static int RunUpdateSyncProbe() {
     W ver, url;
     if (FetchLatest(ver, url)) {
         int st = ClassifyVersion(W(BATFIX_VERSION_WTEXT), ver);
-        CliWrite(L"UPDATE_SYNC fetch=OK version=" + ver + L" state=" + Itow(st) + L"\n");
+        CliWrite(L"UPDATE_SYNC fetch=OK source=" + W(g_updSource) +
+                 L" version=" + ver + L" state=" + Itow(st) + L"\n");
         CliWrite(L"  page=" + url + L"\n");
+        CliWrite(L"  diag=" + W(g_updDiag) + L"\n");
     } else {
-        CliWrite(L"UPDATE_SYNC fetch=FAILED state=" + Itow(UPD_FAILED) + L" (silent)\n");
+        CliWrite(L"UPDATE_SYNC fetch=FAILED state=" + Itow(UPD_FAILED) +
+                 L" (silent) diag=" + W(g_updDiag) + L"\n");
     }
     return 0;                                    // network failure is NOT an app error
 }

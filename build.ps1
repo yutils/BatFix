@@ -226,6 +226,25 @@ function Build-One([string]$arch) {
         return $false
     }
 
+    # A running BatFix keeps its exe mapped, so link.exe cannot overwrite it
+    # (LNK1104). Windows DOES allow renaming a mapped image: move the old
+    # file aside, then link a fresh one. The running instance is unaffected.
+    if (Test-Path -LiteralPath $exe) {
+        try {
+            Remove-Item -LiteralPath $exe -Force -ErrorAction Stop
+        } catch {
+            $stale = "$exe.prev"
+            Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
+            try {
+                Move-Item -LiteralPath $exe -Destination $stale -Force -ErrorAction Stop
+                Info "[$arch] 旧 exe 正在运行，已另存为 $(Split-Path -Leaf $stale)"
+            } catch {
+                Fail "[$arch] 无法替换正在使用的 exe，请关闭 BatFix 后重试"
+                return $false
+            }
+        }
+    }
+
     Info "[$arch] link.exe ..."
     $linkArgs = @('/NOLOGO', '/MANIFEST:NO', '/SUBSYSTEM:WINDOWS',
                   "/MACHINE:$machine", "/OUT:$exe", $obj)

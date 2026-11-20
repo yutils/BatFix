@@ -108,6 +108,22 @@ def is_red(c):
     return c[0] > 180 and c[1] < 120 and c[2] < 120
 
 
+def is_dark_card(c):
+    """Toast card on the light theme: RGB(28,34,46)."""
+    return bool(c) and c[0] < 90 and c[1] < 95 and c[2] < 115
+
+
+def is_light_card(c):
+    """Toast card on the dark theme: RGB(236,241,249)."""
+    return bool(c) and c[0] > 200 and c[1] > 200 and c[2] > 200
+
+
+def read_trace(path):
+    if not os.path.isfile(path):
+        return ''
+    return open(path, 'r', encoding='utf-8', errors='replace').read()
+
+
 print('BatFix v%s  更新检查专项回归' % _VER)
 print('=' * 62)
 
@@ -147,9 +163,19 @@ if all(os.path.isfile(p) for p in shots.values()):
     ck(not is_red(bmp_rgb(shots['plain'], *dot)), '无新版本时该位置不是红点')
     ck(is_red(bmp_rgb(shots['demo'], *dot)), '浅色主题发现新版本 -> 红点可见')
     ck(is_red(bmp_rgb(shots['dark_demo'], *dot)), '深色主题发现新版本 -> 红点可见')
+    ck(not is_dark_card(bmp_rgb(shots['plain'], 300, 500)),
+       '普通预览没有 toast 残留')
+    tb = os.path.join(WORK, 'toast.bmp')
+    tbd = os.path.join(WORK, 'toast_dark.bmp')
+    rr = run(['--shot', tb, '--toast-demo'], timeout=15)
+    ck(rr.returncode == 0 and os.path.isfile(tb) and
+       is_dark_card(bmp_rgb(tb, 300, 500)), 'toast 渲染：浅色主题深色卡片')
+    rr = run(['--shot', tbd, '--toast-demo', '--dark'], timeout=15)
+    ck(rr.returncode == 0 and os.path.isfile(tbd) and
+       is_light_card(bmp_rgb(tbd, 300, 500)), 'toast 渲染：深色主题浅色卡片')
 
 # ---------------------------------------------------------------- 4. async + silent
-print('[4] 启动不阻塞 + 联网失败静默')
+print('[4] 启动不阻塞 + 检查过程不弹模态对话框')
 close_all()
 p = subprocess.Popen([EXE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:
@@ -184,14 +210,15 @@ try:
         u32.SendMessageW(hwnd, WM_LBUTTONDOWN, 0, lp)
         u32.SendMessageW(hwnd, WM_LBUTTONUP, 0, lp)
 
-        # Wait long enough for the request to finish (or time out), then look
-        # for any dialog window owned by this process. A failed check must
-        # produce none -- that is the "silent" requirement.
+        # Wait long enough for the check to finish (or time out), then look
+        # for any dialog window owned by this process. Neither success nor
+        # failure may raise a modal box -- that is the "no interruption" rule.
         time.sleep(4.0)
         wins = top_windows(p.pid)
         ck(any(c == CLASS for _, c in wins), '主窗口仍在运行')
         ck(not any(c == '#32770' for _, c in wins),
-           '联网失败未弹出任何对话框 (窗口类: %s)' % ','.join(c for _, c in wins))
+           '检查完成/失败都未弹出任何对话框 (窗口类: %s)' %
+           ','.join(c for _, c in wins))
     # wait a little more and confirm no late dialog appears
     time.sleep(1.0)
     ck(not any(c == '#32770' for _, c in top_windows(p.pid)),
@@ -334,6 +361,79 @@ finally:
                 p2.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 p2.kill()
+
+# ---------------------------------------------------------------- 7. toast on click
+# Screen pixel grabbing is unreliable under DWM, so the app exposes a tiny
+# opt-in diagnostic hook (BATFIX_TOAST_TRACE) that records toast events.
+# A normal launch never sets the variable, so users see zero side effects.
+print('[7] 点击检查更新 -> 检查成功且最新版 -> toast（非弹窗、自动消失）')
+close_all()
+trace = os.path.join(WORK, 'toast_trace.txt')
+if os.path.isfile(trace):
+    os.remove(trace)
+env = dict(os.environ)
+env['BATFIX_TOAST_TRACE'] = trace
+p3 = subprocess.Popen([EXE, '--update-file', paths['同版本']], env=env,
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    hwnd = 0
+    t0 = time.time()
+    while time.time() - t0 < 5:
+        hwnd = find_main()
+        if hwnd:
+            break
+        time.sleep(0.02)
+    ck(bool(hwnd), '主窗口创建成功')
+    if hwnd:
+        time.sleep(0.9)                       # let the startup check finish
+        ck('TOAST ' not in read_trace(trace),
+           '启动自动检查不打扰用户（不会 toast）')
+
+        rc = wintypes.RECT()
+        u32.GetClientRect(hwnd, ctypes.byref(rc))
+        cx = rc.right - rc.left
+        hdc = u32.GetDC(0)
+        dpi = g32.GetDeviceCaps(hdc, 88)
+        u32.ReleaseDC(0, hdc)
+        S = dpi / 96.0 if dpi else 1.0
+        x, y = int((cx - 134) * S + .5), int(31 * S + .5)
+        lp = (y << 16) | (x & 0xFFFF)
+        u32.PostMessageW(hwnd, WM_LBUTTONDOWN, 0, lp)
+        u32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lp)
+
+        body = ''
+        t0 = time.time()
+        while time.time() - t0 < 4:
+            body = read_trace(trace)
+            if 'TOAST 已是最新版' in body:
+                break
+            time.sleep(0.08)
+        ck('TOAST 已是最新版' in body,
+           '点击 -> 检查成功且最新版 -> 触发 toast：%r' % body.strip())
+        ck(('v' + _VER) in body, 'toast 文案含当前版本号')
+        ck(not any(c2 == '#32770' for _, c2 in top_windows(p3.pid)),
+           'toast 是非模态浮层，未出现 #32770 对话框')
+
+        t0 = time.time()
+        while time.time() - t0 < 4:
+            body = read_trace(trace)
+            if 'TOAST_END' in body:
+                break
+            time.sleep(0.1)
+        ck('TOAST_END' in body, 'toast 约 2.4 秒后自动消失')
+finally:
+    h = find_main()
+    if h:
+        u32.PostMessageW(h, WM_CLOSE, 0, 0)
+    if p3.poll() is None:
+        try:
+            p3.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            p3.terminate()
+            try:
+                p3.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                p3.kill()
 
 print('=' * 62)
 if failures:
